@@ -1,0 +1,121 @@
+name: macOS Sequoia VNC Cloud Stream
+
+on:
+  workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: 'VNC Stream Password'
+        required: true
+        default: 'runnerpass'
+        type: string
+      duration:
+        description: 'Session timeout in minutes (max 360)'
+        required: true
+        default: '360'
+        type: string
+
+jobs:
+  macos-sequoia:
+    runs-on: macos-15
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Optimize Runner Performance & Disable Spotlight
+        run: |
+          echo "=== Tuning macOS Host for Speed ==="
+          # Stop spotlight indexing to reclaim intense CPU & disk I/O
+          sudo mdutil -i off -a
+          
+          # Prevent system sleep
+          sudo pmset -a sleep 0
+          sudo pmset -a disksleep 0
+          sudo pmset -a hibernatemode 0
+          
+          echo "Hardware Architecture: $(uname -m)"
+          echo "CPU Cores: $(sysctl -n hw.ncpu)"
+          echo "Memory: $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 )) GB"
+
+      - name: Provision VNC User (Bypassing SecureToken)
+        env:
+          VNC_PASS: ${{ inputs.vnc_password }}
+        run: |
+          echo "=== Creating local vncuser account ==="
+          USER_ID=1001
+          sudo dscl . -create /Users/vncuser
+          sudo dscl . -create /Users/vncuser UserShell /bin/bash
+          sudo dscl . -create /Users/vncuser RealName "VNC User"
+          sudo dscl . -create /Users/vncuser UniqueID $USER_ID
+          sudo dscl . -create /Users/vncuser PrimaryGroupID 20
+          sudo dscl . -create /Users/vncuser NFSHomeDirectory /Users/vncuser
+          sudo dscl . -passwd /Users/vncuser "$VNC_PASS"
+          
+          # Build proper home folder structure to avoid missing-profile UI glitches
+          sudo createhomedir -c -u vncuser > /dev/null
+          sudo chown -R vncuser:staff /Users/vncuser
+          
+          # Give vncuser administrative rights if needed
+          sudo dseditgroup -o edit -a vncuser -t user admin
+
+      - name: Configure Native VNC & Hex-Hash Authentication
+        env:
+          VNC_PASS: ${{ inputs.vnc_password }}
+        run: |
+          echo "=== Configuring Native Screen Sharing Daemon ==="
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -configure -allowAccessFor -allUsers -privs -all
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -configure -clientopts -setvnclegacy -vnclegacy yes 
+          
+          echo "=== Injecting legacy VNC password hash into preferences ==="
+          # Converts plain text password into the DES hex format required by AppleVNCServer plist
+          echo "$VNC_PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+          
+          # Restart Remote Management agent to apply configuration
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent -console
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate
+
+      - name: Install Cloudflare Tunnel & WebVNC Server
+        run: |
+          echo "=== Installing dependencies via Homebrew ==="
+          brew install --quiet cloudflared tigervnc noVNC websockify
+          
+          # Create symbolic link for web UI
+          ln -s /opt/homebrew/share/novnc /tmp/novnc
+
+      - name: Start Web-VNC Bridge and Cloudflare Quick Tunnel
+        run: |
+          # Bridge local VNC port 5900 to HTML5 WebSockets on port 6080
+          python3 /opt/homebrew/opt/websockify/libexec/websockify --web=/opt/homebrew/share/novnc 6080 localhost:5900 &
+          
+          # Spin up Cloudflare Quick Tunnel (Free, zero configuration required)
+          cloudflared tunnel --url http://localhost:6080 > cf_url.txt 2>&1 &
+          
+          sleep 6
+          echo "=================================================================="
+          cat cf_url.txt
+          echo "=================================================================="
+
+      - name: Output Connection Link & Keep-Alive Loop
+        run: |
+          CF_URL=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" cf_url.txt | head -n 1)
+          VNC_PASSWORD="${{ inputs.vnc_password }}"
+          
+          if [ -z "$CF_URL" ]; then
+            echo "Tunnel URL generation delayed. Inspecting raw logs:"
+            cat cf_url.txt
+          else
+            echo "##################################################################"
+            echo "🚀 YOUR MACOS SEQUOIA DESK STREAM IS READY:"
+            echo "$CF_URL/vnc.html?autoconnect=true&resize=scale&password=$VNC_PASSWORD"
+            echo "##################################################################"
+          fi
+          
+          # Keep the session alive for the requested duration
+          TIMEOUT_MINS="${{ inputs.duration }}"
+          for ((i=1; i<=$TIMEOUT_MINS; i++)); do
+            sleep 60
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "Session still active: $i / $TIMEOUT_MINS minutes elapsed..."
+            fi
+          done
